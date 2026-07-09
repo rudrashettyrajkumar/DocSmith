@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Fraunces", Georgia, serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --color-ink-950: #0b0f14;
+  --color-ink-900: #10161d;
+  --color-ink-800: #1a232d;
+  --color-ink-700: #263241;
+  --color-brass-300: #ecd9a0;
+  --color-brass-400: #dcbf72;
+  --color-brass-500: #c9a24b;
+  --color-sea-400: #4fd1b5;
+}
+
+body {
+  background:
+    radial-gradient(1100px 500px at 80% -10%, rgba(201, 162, 75, 0.08), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(79, 209, 181, 0.06), transparent 60%),
+    var(--color-ink-950);
+  color: #e8edf2;
+  min-height: 100vh;
+}
+
+::selection { background: rgba(201, 162, 75, 0.35); }
+
+.card {
+  background: linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.015));
+  border: 1px solid rgba(255,255,255,0.09);
+  border-radius: 1rem;
+  backdrop-filter: blur(6px);
+}
+
+.field {
+  background: rgba(0,0,0,0.35);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 0.6rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.field:focus-within, .field:focus {
+  outline: none;
+  border-color: var(--color-brass-400);
+  box-shadow: 0 0 0 3px rgba(201, 162, 75, 0.15);
+}
+
+select.field option { background: var(--color-ink-900); color: #e8edf2; }
+
+.scroll-slim::-webkit-scrollbar { width: 6px; height: 6px; }
+.scroll-slim::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 3px; }
+.scroll-slim::-webkit-scrollbar-track { background: transparent; }
