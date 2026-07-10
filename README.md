@@ -41,10 +41,15 @@ Key production behaviors:
 - **Async jobs** — agent runs take 15–90s, so the API returns a `job_id` instantly
   and the UI polls; the server stays responsive.
 - **Live agent transparency** — the UI streams the agent's self-written TODO list
-  (with per-task status), tool calls, assumptions, and timing.
+  (with per-task status), tool calls, assumptions, timing, and the document text
+  itself token-by-token as the model writes it ("Live draft" pane).
 - **Error handling & recovery** — invalid keys/models fail as a clean job error;
   malformed tool JSON is bounced back to the model to self-correct; if the agent
   forgets to call the docx tool, a recovery path builds the document from its answer.
+- **Rate-limit survival (free tiers)** — if the provider dies mid-run (e.g. Groq
+  free-tier 429), the truncated document JSON is repaired from the live token
+  stream into a partial `.docx` the user can download, and the UI shows a
+  dedicated "API limit reached — use a premium key" screen instead of a raw error.
 
 ## Run it
 
