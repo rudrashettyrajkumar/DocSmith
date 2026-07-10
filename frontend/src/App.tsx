@@ -14,14 +14,19 @@ type JobResult = {
   assumptions: string[];
   summary: string;
   download_url: string;
+  partial?: boolean;
 };
 type Job = {
   id: string;
+  provider: string;
+  model: string;
   status: "queued" | "running" | "completed" | "failed";
   todos: Todo[];
   events: JobEvent[];
+  stream_text: string;
   result: JobResult | null;
   error: string | null;
+  error_type: "rate_limit" | "auth" | "unknown" | null;
   elapsed_seconds: number;
 };
 
@@ -46,6 +51,19 @@ const SAMPLES = [
 /* ------------------------------------------------------------- helpers */
 
 const spring = { type: "spring", stiffness: 320, damping: 28 } as const;
+
+/** The raw stream includes the JSON envelope of the save_word_document tool
+ * call (that's where the model writes the document) — strip it and undo the
+ * common string escapes so the live pane reads like a document being typed. */
+function cleanDraft(raw: string): string {
+  return raw
+    .replace(/\{\s*"document_json"\s*:\s*"/g, "")
+    .replace(/"\s*\}\s*(\n\n|$)/g, "$1")
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "  ")
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, "\\");
+}
 
 function useLocalStorage(key: string, initial: string) {
   const [value, setValue] = useState(() => localStorage.getItem(key) ?? initial);
@@ -118,6 +136,19 @@ export default function App() {
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState("");
   const pollRef = useRef<number | null>(null);
+  const keyInputRef = useRef<HTMLInputElement | null>(null);
+  const draftRef = useRef<HTMLDivElement | null>(null);
+
+  // keep the live draft scrolled to the newest tokens
+  useEffect(() => {
+    const el = draftRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [job?.stream_text]);
+
+  const focusApiKey = () => {
+    keyInputRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    keyInputRef.current?.focus();
+  };
 
   useEffect(() => {
     fetch("/api/models")
@@ -167,7 +198,7 @@ export default function App() {
         const j: Job = await (await fetch(`/api/jobs/${job_id}`)).json();
         setJob(j);
         if (j.status === "completed" || j.status === "failed") stopPolling();
-      }, 1200);
+      }, 800);
     } catch (e) {
       setFormError(e instanceof Error ? e.message : "Something went wrong.");
     } finally {
@@ -244,7 +275,7 @@ export default function App() {
           <label className="mb-1 block text-xs font-medium text-white/60">
             {providerMeta.label} API key <span className="text-white/35">· get one at {providerMeta.keyUrl}</span>
           </label>
-          <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…"
+          <input ref={keyInputRef} type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…"
             className="field mb-6 w-full px-3 py-2.5 font-mono text-sm text-white placeholder-white/30" />
 
           <h2 className="mb-3 font-display text-lg font-semibold">2 · Describe the document</h2>
@@ -309,9 +340,31 @@ export default function App() {
                   : <p className="text-sm text-white/40">Waiting for the agent to write its plan…</p>}
               </div>
 
-              <div className="min-h-0 flex-1">
+              {job.stream_text && (
+                <div className="flex min-h-0 flex-1 flex-col">
+                  <p className="mb-2 flex items-center gap-2 font-mono text-[11px] uppercase tracking-[0.2em] text-white/40">
+                    Live draft
+                    {running && (
+                      <motion.span animate={{ opacity: [1, 0.25, 1] }} transition={{ repeat: Infinity, duration: 1.4 }}
+                        className="h-1.5 w-1.5 rounded-full bg-brass-400" />
+                    )}
+                  </p>
+                  <div ref={draftRef}
+                    className="scroll-slim min-h-[140px] flex-1 overflow-y-auto rounded-xl border border-white/10 bg-white/[0.04] p-4">
+                    <pre className="whitespace-pre-wrap font-sans text-[13px] leading-6 text-white/75">
+                      {cleanDraft(job.stream_text)}
+                      {running && (
+                        <motion.span animate={{ opacity: [1, 0, 1] }} transition={{ repeat: Infinity, duration: 0.9 }}
+                          className="ml-0.5 inline-block h-3.5 w-[2px] translate-y-0.5 bg-brass-300" />
+                      )}
+                    </pre>
+                  </div>
+                </div>
+              )}
+
+              <div className={job.stream_text ? "" : "min-h-0 flex-1"}>
                 <p className="mb-2 font-mono text-[11px] uppercase tracking-[0.2em] text-white/40">Log</p>
-                <div className="scroll-slim max-h-36 space-y-1.5 overflow-y-auto pr-1">
+                <div className="scroll-slim max-h-28 space-y-1.5 overflow-y-auto pr-1">
                   {job.events.map((e, i) => (
                     <motion.p key={i} initial={{ opacity: 0 }} animate={{ opacity: 1 }}
                       className="font-mono text-[11.5px] text-white/55">
@@ -322,12 +375,73 @@ export default function App() {
               </div>
 
               <AnimatePresence>
-                {job.status === "failed" && (
+                {job.status === "failed" && job.error_type === "rate_limit" && (
+                  <motion.div initial={{ opacity: 0, y: 16, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={spring}
+                    className="rounded-xl border border-brass-400/40 bg-gradient-to-br from-brass-400/15 via-brass-500/[0.07] to-transparent p-5">
+                    <div className="flex items-start gap-3">
+                      <motion.span animate={{ rotate: [0, -12, 12, 0] }} transition={{ repeat: Infinity, duration: 2.4, ease: "easeInOut" }}
+                        className="text-2xl">⏳</motion.span>
+                      <div className="min-w-0 flex-1">
+                        <p className="font-display text-lg font-semibold text-brass-300">Your model's API limit has been reached</p>
+                        <p className="mt-1 text-sm leading-6 text-white/65">
+                          The free tier for <span className="font-mono text-xs text-brass-200">{job.model}</span> ran
+                          out of tokens mid-run. Paste a premium API key — or switch to another provider or model — and run it again.
+                        </p>
+                        {job.result && (
+                          <p className="mt-2 flex items-center gap-1.5 text-xs text-sea-400">
+                            <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2">
+                              <path d="M3 8.5l3.2 3L13 4.5" strokeLinecap="round" strokeLinejoin="round" />
+                            </svg>
+                            Everything generated so far was recovered into a Word document.
+                          </p>
+                        )}
+                        <div className="mt-4 flex flex-wrap gap-2">
+                          {job.result && (
+                            <a href={job.result.download_url}
+                              className="inline-flex items-center gap-2 rounded-lg bg-brass-400 px-4 py-2.5 text-sm font-semibold text-ink-950 transition hover:brightness-110">
+                              <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8">
+                                <path d="M8 2v8m0 0l-3-3m3 3l3-3M3 13h10" strokeLinecap="round" strokeLinejoin="round" />
+                              </svg>
+                              Download partial draft (.docx)
+                            </a>
+                          )}
+                          <button onClick={focusApiKey}
+                            className="inline-flex items-center gap-2 rounded-lg border border-brass-400/50 px-4 py-2.5 text-sm font-semibold text-brass-300 transition hover:bg-brass-400/10">
+                            Use a premium key →
+                          </button>
+                        </div>
+                        <p className="mt-3 truncate font-mono text-[10.5px] text-white/30" title={job.error ?? undefined}>{job.error}</p>
+                      </div>
+                    </div>
+                  </motion.div>
+                )}
+
+                {job.status === "failed" && job.error_type !== "rate_limit" && (
                   <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
                     className="rounded-xl border border-red-500/30 bg-red-500/10 p-4">
-                    <p className="mb-1 text-sm font-semibold text-red-300">The run failed</p>
+                    <p className="mb-1 text-sm font-semibold text-red-300">
+                      {job.error_type === "auth" ? "API key rejected" : "The run failed"}
+                    </p>
                     <p className="font-mono text-xs leading-5 text-red-200/70">{job.error}</p>
-                    <p className="mt-2 text-xs text-white/50">Check your API key and model choice, then try again — nothing was stored.</p>
+                    <p className="mt-2 text-xs text-white/50">
+                      {job.error_type === "auth"
+                        ? `The ${job.provider} key you pasted was not accepted — double-check it and try again. Keys are never stored.`
+                        : "Check your API key and model choice, then try again — nothing was stored."}
+                    </p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {job.result && (
+                        <a href={job.result.download_url}
+                          className="inline-flex items-center gap-2 rounded-lg bg-white/10 px-3 py-2 text-xs font-semibold text-white/80 transition hover:bg-white/15">
+                          Download partial draft (.docx)
+                        </a>
+                      )}
+                      {job.error_type === "auth" && (
+                        <button onClick={focusApiKey}
+                          className="rounded-lg border border-white/20 px-3 py-2 text-xs font-semibold text-white/70 transition hover:bg-white/10">
+                          Fix API key →
+                        </button>
+                      )}
+                    </div>
                   </motion.div>
                 )}
 

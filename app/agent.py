@@ -7,8 +7,11 @@ drafting, and the tool-calling loop. We supply:
   - a `save_word_document` tool that renders the final .docx (app.docgen)
   - a system prompt that defines the document-writing workflow
 
-`run_agent_job` streams the graph and forwards every todo-list update and
-tool call to a callback so the API/UI can show live progress.
+`run_agent_job` streams the graph and forwards every todo-list update, tool
+call AND raw LLM token to a callback so the API/UI can show the document being
+written live. If the provider dies mid-run (free-tier 429s are the classic
+case) we salvage whatever was generated into a partial .docx and raise
+`AgentInterrupted` so the caller can offer it for download.
 """
 
 import json
@@ -18,7 +21,7 @@ from typing import Callable
 
 from deepagents import create_deep_agent
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.tools import tool
 
 from app import docgen
@@ -46,6 +49,22 @@ Workflow you must follow:
 """
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+_DOC_JSON_PREFIX = re.compile(r'^\s*\{\s*"document_json"\s*:\s*"')
+
+SAVE_TOOL_NAME = "save_word_document"
+
+
+class AgentInterrupted(Exception):
+    """The agent run died mid-generation (rate limit, network, ...).
+
+    `partial` carries a result dict for the salvaged partial .docx, or None if
+    nothing usable was generated before the failure.
+    """
+
+    def __init__(self, original: Exception, partial: dict | None):
+        super().__init__(str(original))
+        self.original = original
+        self.partial = partial
 
 
 def _parse_document_json(document_json: str) -> dict:
@@ -93,12 +112,166 @@ def _make_save_tool(sink: dict) -> Callable:
     return save_word_document
 
 
+# --------------------------------------------------------------- streaming
+
+
+def _chunk_text(chunk: AIMessageChunk) -> str:
+    """Plain-text delta of a message chunk (handles str and block content)."""
+    content = chunk.content
+    if isinstance(content, str):
+        return content
+    return "".join(
+        block.get("text", "") for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+class _StreamCollector:
+    """Accumulates token deltas across the run for live display + recovery.
+
+    We forward the model's prose AND the arguments it streams into the
+    save_word_document tool call (that is where the actual document text is
+    generated), but skip write_todos / other tool args — they are plumbing.
+    """
+
+    def __init__(self, on_delta: Callable[[str], None]):
+        self._on_delta = on_delta
+        self._tool_names: dict[int, str] = {}  # tool_call index -> name (this message)
+        self._message_id: str | None = None
+        self.draft = ""            # everything shown to the user
+        self.doc_args = ""         # raw save_word_document args JSON (for recovery)
+
+    def feed(self, chunk: AIMessageChunk) -> None:
+        if chunk.id and chunk.id != self._message_id:  # new model turn
+            self._message_id = chunk.id
+            self._tool_names = {}
+            if self.draft and not self.draft.endswith("\n\n"):
+                self._emit("\n\n")
+
+        delta = _chunk_text(chunk)
+        if delta:
+            self._emit(delta)
+
+        for tc in chunk.tool_call_chunks or []:
+            index = tc.get("index") or 0
+            if tc.get("name"):
+                self._tool_names[index] = tc["name"]
+            args = tc.get("args")
+            if args and self._tool_names.get(index) == SAVE_TOOL_NAME:
+                self.doc_args += args
+                self._emit(args)
+
+    def _emit(self, delta: str) -> None:
+        self.draft += delta
+        self._on_delta(delta)
+
+
+# ------------------------------------------------------- partial recovery
+
+
+def _close_truncated_json(text: str) -> str:
+    """Append whatever closers a truncated JSON document needs to parse."""
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+    if escaped:  # cut off mid-escape — drop the dangling backslash
+        text = text[:-1]
+    return text + ('"' if in_string else "") + "".join(reversed(stack))
+
+
+def _clean_draft_text(raw: str) -> str:
+    """Make the raw token stream readable: drop the tool-call JSON envelope
+    and undo the most common string escapes."""
+    text = _DOC_JSON_PREFIX.sub("", raw.strip())
+    return (
+        text.replace('\\"', '"')
+        .replace("\\n", "\n")
+        .replace("\\t", "  ")
+        .replace("\\\\", "\\")
+    )
+
+
+def _try_parse_partial_doc(doc_args: str) -> dict | None:
+    """Best effort: repair the truncated save_word_document arguments into a
+    structured document. Two layers: the outer tool-args JSON, then the
+    document JSON string inside it."""
+    if not doc_args.strip():
+        return None
+    try:
+        outer = json.loads(_close_truncated_json(doc_args))
+        inner = outer.get("document_json", "") if isinstance(outer, dict) else ""
+        if not isinstance(inner, str) or not inner.strip():
+            return None
+        doc = _parse_document_json(_close_truncated_json(inner))
+        return doc if isinstance(doc, dict) and doc.get("title") and doc.get("sections") else None
+    except (json.JSONDecodeError, ValueError, AttributeError):
+        return None
+
+
+def _recover_partial_document(request: str, collector: _StreamCollector, reason: str) -> dict | None:
+    """Build a partial .docx from whatever the model generated before dying."""
+    note = (
+        "Generation was interrupted by the model provider "
+        f"({reason}). This document is a partial draft recovered from the live stream."
+    )
+    doc = _try_parse_partial_doc(collector.doc_args)
+    if doc is None:
+        text = _clean_draft_text(collector.draft)
+        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+        if not paragraphs:
+            return None
+        doc = {
+            "title": request.strip().capitalize()[:80],
+            "sections": [{"heading": "Recovered draft (incomplete)", "paragraphs": paragraphs, "bullets": []}],
+        }
+    doc.setdefault("document_type", "Business Document")
+    doc.setdefault("audience", "Business stakeholders")
+    doc.setdefault("assumptions", [])
+    doc["assumptions"] = [note, *doc["assumptions"]]
+    try:
+        filename = docgen.build_docx(doc)
+    except Exception:  # never let recovery mask the real error
+        logger.exception("Failed to build partial document")
+        return None
+    return {
+        "filename": filename,
+        "title": doc["title"],
+        "document_type": doc["document_type"],
+        "assumptions": doc["assumptions"],
+        "summary": "The run was interrupted before the document was finished — "
+                   "this file contains everything generated up to that point.",
+        "partial": True,
+    }
+
+
+# --------------------------------------------------------------- main run
+
+
 def run_agent_job(
     chat_model: BaseChatModel,
     request: str,
     on_event: Callable[[str, object], None],
 ) -> dict:
-    """Run the deep agent to completion. Emits ("todos"|"event", payload) via on_event."""
+    """Run the deep agent to completion.
+
+    Emits ("todos"|"event"|"stream", payload) via on_event. Raises
+    AgentInterrupted (carrying a partial result when possible) if the
+    provider fails mid-run.
+    """
     sink: dict = {}
     agent = create_deep_agent(
         model=chat_model,
@@ -106,31 +279,53 @@ def run_agent_job(
         system_prompt=SYSTEM_PROMPT,
     )
 
+    collector = _StreamCollector(lambda delta: on_event("stream", delta))
     last_todos_repr = ""
     final_text = ""
-    for state in agent.stream(
-        {"messages": [{"role": "user", "content": request}]},
-        config={"recursion_limit": RECURSION_LIMIT},
-        stream_mode="values",
-    ):
-        todos = state.get("todos") or []
-        todos_repr = repr(todos)
-        if todos and todos_repr != last_todos_repr:
-            last_todos_repr = todos_repr
-            on_event("todos", [{"content": t["content"], "status": t["status"]} for t in todos])
+    try:
+        for mode, payload in agent.stream(
+            {"messages": [{"role": "user", "content": request}]},
+            config={"recursion_limit": RECURSION_LIMIT},
+            stream_mode=["values", "messages"],
+        ):
+            if mode == "messages":
+                chunk, _meta = payload
+                if isinstance(chunk, AIMessageChunk):
+                    collector.feed(chunk)
+                continue
 
-        message = state["messages"][-1] if state.get("messages") else None
-        if isinstance(message, AIMessage) and message.tool_calls:
-            for call in message.tool_calls:
-                if call["name"] != "write_todos":  # todo updates already shown above
-                    on_event("event", f"Calling tool: {call['name']}")
-        elif isinstance(message, ToolMessage) and str(message.content).startswith("ERROR"):
-            on_event("event", f"Tool error, agent will retry: {str(message.content)[:120]}")
-        elif isinstance(message, AIMessage) and not message.tool_calls and message.content:
-            content = message.content
-            final_text = content if isinstance(content, str) else " ".join(
-                b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
-            )
+            state = payload
+            todos = state.get("todos") or []
+            todos_repr = repr(todos)
+            if todos and todos_repr != last_todos_repr:
+                last_todos_repr = todos_repr
+                on_event("todos", [{"content": t["content"], "status": t["status"]} for t in todos])
+
+            message = state["messages"][-1] if state.get("messages") else None
+            if isinstance(message, AIMessage) and message.tool_calls:
+                for call in message.tool_calls:
+                    if call["name"] != "write_todos":  # todo updates already shown above
+                        on_event("event", f"Calling tool: {call['name']}")
+            elif isinstance(message, ToolMessage) and str(message.content).startswith("ERROR"):
+                on_event("event", f"Tool error, agent will retry: {str(message.content)[:120]}")
+            elif isinstance(message, AIMessage) and not message.tool_calls and message.content:
+                content = message.content
+                final_text = content if isinstance(content, str) else " ".join(
+                    b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+                )
+    except Exception as exc:
+        if "filename" in sink:
+            # The document itself was already saved — only the final summary
+            # died. Deliver the run as a success rather than failing it.
+            logger.warning("Run failed after document was saved (%s) — completing anyway", exc)
+            on_event("event", "Provider failed after the document was saved — delivering it")
+        else:
+            logger.exception("Agent run interrupted, attempting partial recovery")
+            on_event("event", f"Run interrupted: {type(exc).__name__} — recovering partial document")
+            partial = _recover_partial_document(request, collector, type(exc).__name__)
+            if partial:
+                on_event("event", f"Partial document saved as {partial['filename']}")
+            raise AgentInterrupted(exc, partial) from exc
 
     # Recovery: agent produced prose but never called the docx tool.
     if "filename" not in sink:
@@ -152,4 +347,5 @@ def run_agent_job(
         "document_type": sink["document"]["document_type"],
         "assumptions": sink["document"].get("assumptions", []),
         "summary": final_text or f"Created '{sink['document']['title']}'.",
+        "partial": False,
     }
