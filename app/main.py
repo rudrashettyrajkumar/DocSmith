@@ -33,7 +33,7 @@ app = FastAPI(
     version="2.0.0",
 )
 
-app.add_middleware(  # allows running the Vite dev server separately during development
+app.add_middleware(  # open CORS: no cookies/session state, and the frontend may be on a separate origin (e.g. Vercel)
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
